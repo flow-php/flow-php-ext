@@ -2,11 +2,10 @@
 
 declare(strict_types=1);
 
-namespace Flow\Floe;
+namespace Flow\ETL\Row;
 
-use Flow\ETL\Row;
 use Flow\ETL\Rows;
-use Flow\Floe\Exception\ExtensionException;
+use Flow\ETL\Schema;
 use RuntimeException;
 
 use function extension_loaded;
@@ -15,11 +14,7 @@ if (extension_loaded('flow_php')) {
     return;
 }
 
-/**
- * Stateful Floe frame decoder for streaming reads - the PHP side keeps
- * buffering/framing and hands over bare SCHEMA/ROW frame bodies.
- */
-final class RowsDecoder
+final class RustRowHydratorNative
 {
     public function __construct()
     {
@@ -27,27 +22,25 @@ final class RowsDecoder
     }
 
     /**
-     * @throws ExtensionException
+     * @param list<RawRowValues> $batch
      */
-    public function row(string $frameBody): Row
+    public function cast(array $batch, Schema $schema): Rows
     {
         throw new RuntimeException('flow_php extension is not loaded');
     }
 
     /**
-     * @param array<string> $frameBodies
-     *
-     * @throws ExtensionException
+     * @param list<RawRowValues> $batch
      */
-    public function rows(array $frameBodies): Rows
+    public function hydrate(array $batch, ?Schema $schema = null): Rows
     {
         throw new RuntimeException('flow_php extension is not loaded');
     }
 
     /**
-     * @throws ExtensionException
+     * @return list<TypedRowValues>
      */
-    public function schema(string $frameBody): void
+    public function dehydrate(Rows $rows): array
     {
         throw new RuntimeException('flow_php extension is not loaded');
     }
