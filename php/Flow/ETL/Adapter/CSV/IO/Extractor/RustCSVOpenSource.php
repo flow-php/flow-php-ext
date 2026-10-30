@@ -2,14 +2,13 @@
 
 declare(strict_types=1);
 
-namespace Flow\ETL\Adapter\CSV;
+namespace Flow\ETL\Adapter\CSV\IO\Extractor;
 
-use Flow\ETL\Column\Backend;
-use Flow\ETL\Rows;
-use Flow\ETL\RustIterator;
-use Flow\ETL\Schema;
-use Flow\ETL\Schema\Inference\ColumnTypes;
-use Flow\ETL\Schema\Inference\SchemaInference;
+use Flow\ETL\IO\Inference\ColumnTypes;
+use Flow\ETL\Values\Column\Backend;
+use Flow\ETL\Values\Rows;
+use Flow\ETL\Values\RustIterator;
+use Flow\ETL\Values\Schema;
 use Flow\Filesystem\SourceStream;
 use Flow\Types\Type\TypeNarrower;
 use RuntimeException;
@@ -22,6 +21,10 @@ if (extension_loaded('flow_php')) {
 
 final class RustCSVOpenSource implements CSVOpenSource
 {
+    /**
+     * @param null|list<string> $headers the names of a stream that carries no header record - a window cut past a
+     *                                   file's first record; withHeader must be false
+     */
     public function __construct(
         SourceStream $stream,
         string $separator,
@@ -31,6 +34,7 @@ final class RustCSVOpenSource implements CSVOpenSource
         bool $emptyToNull,
         bool $removeBOM,
         ?int $charactersReadInLine = null,
+        ?array $headers = null,
     ) {
         throw new RuntimeException('flow_php extension is not loaded');
     }
@@ -76,7 +80,7 @@ final class RustCSVOpenSource implements CSVOpenSource
         throw new RuntimeException('flow_php extension is not loaded');
     }
 
-    public function sniff(array $names, int $rowBudget, SchemaInference $inference, TypeNarrower $typer): ColumnTypes
+    public function sniff(array $names, int $rowBudget, TypeNarrower $typer): ColumnTypes
     {
         throw new RuntimeException('flow_php extension is not loaded');
     }

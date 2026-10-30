@@ -2,9 +2,9 @@
 
 declare(strict_types=1);
 
-namespace Flow\ETL\Adapter\CSV;
+namespace Flow\ETL\Adapter\CSV\IO\Loader;
 
-use Flow\ETL\Rows;
+use Flow\ETL\Values\Rows;
 use RuntimeException;
 
 use function extension_loaded;
@@ -18,15 +18,8 @@ final class RustCSVEncoder implements CSVEncoder
     /**
      * @param PhpCSVEncoder $php renders the columns this writer does not render itself, and the header
      */
-    public function __construct(
-        string $separator,
-        string $enclosure,
-        string $escape,
-        string $newLineSeparator,
-        string $dateTimeFormat,
-        string $dateFormat,
-        PhpCSVEncoder $php,
-    ) {
+    public function __construct(CSVWriteOptions $options, PhpCSVEncoder $php)
+    {
         throw new RuntimeException('flow_php extension is not loaded');
     }
 

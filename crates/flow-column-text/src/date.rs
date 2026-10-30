@@ -1,11 +1,7 @@
 //! `DateTimeInterface::format()` (ext/date `date_format()`) for the letters the native writers render, over an
 //! instant in µs and the column zone. Any other letter makes the format unparseable: the column is rendered in PHP.
 
-use ext_php_rs::exception::PhpException;
-
-use crate::ctx::{self, call_method, ht_get, zval_long};
-use crate::exception::ext_exception;
-use crate::text::int;
+use crate::int;
 
 pub const LETTERS: &[u8] = b"YymndjHGisuveTPpOZUc";
 
@@ -58,6 +54,14 @@ pub struct Transition {
     pub abbreviation: Vec<u8>,
 }
 
+/// Where a named zone's transitions come from: `DateTimeZone::getTransitions($min, $max + 1)`, the offset in force at
+/// `min_second` first, then every change up to and including `max_second`. flow_php asks PHP; a test supplies a list.
+pub trait Transitions {
+    type Error;
+
+    fn of(&self, zone: &[u8], min_second: i64, max_second: i64) -> Result<Vec<Transition>, Self::Error>;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Zone {
     Utc,
@@ -93,47 +97,15 @@ impl Zone {
         }
     }
 
-    /// A named zone reads `DateTimeZone::getTransitions($min, $max + 1)`: the offset in force at `$min`, then every
-    /// change up to and including `$max`. PHP built against the system tzdata (Debian, Ubuntu) leaves out a transition
-    /// at exactly the end of the range, PHP's bundled database keeps it. Once per batch per column.
-    pub fn resolve(&mut self, min_second: i64, max_second: i64) -> Result<(), PhpException> {
-        let Zone::Named { id, transitions } = self else {
-            return Ok(());
-        };
-
-        let listed = call_method(
-            &ctx::timezone(id)?,
-            "getTransitions",
-            &mut [zval_long(min_second), zval_long(max_second.saturating_add(1))],
-        )?;
-        let listed = listed
-            .array()
-            .ok_or_else(|| ext_exception("flow_php expected DateTimeZone::getTransitions() to return an array"))?;
-
-        transitions.clear();
-
-        for transition in listed.values() {
-            let field = |name: &[u8]| {
-                transition
-                    .array()
-                    .and_then(|transition| ht_get(transition, name))
-                    .ok_or_else(|| ext_exception("flow_php expected a time zone transition of ts, offset and abbr"))
-            };
-
-            transitions.push(Transition {
-                from: field(b"ts")?.long().unwrap_or(min_second),
-                offset: field(b"offset")?.long().unwrap_or(0) as i32,
-                abbreviation: field(b"abbr")?
-                    .zend_str()
-                    .map(|abbr| abbr.as_bytes().to_vec())
-                    .unwrap_or_default(),
-            });
-        }
-
-        if transitions.is_empty() {
-            return Err(ext_exception(
-                "flow_php expected DateTimeZone::getTransitions() to list the offset in force",
-            ));
+    /// A named zone takes the transitions over the instants it renders, once per batch per column.
+    pub fn resolve<T: Transitions>(
+        &mut self,
+        min_second: i64,
+        max_second: i64,
+        transitions: &T,
+    ) -> Result<(), T::Error> {
+        if let Zone::Named { id, transitions: held } = self {
+            *held = transitions.of(id, min_second, max_second)?;
         }
 
         Ok(())
@@ -300,7 +272,7 @@ pub fn write(out: &mut Vec<u8>, format: &Format, micros: i64, zone: &Zone) {
 
 #[cfg(test)]
 mod tests {
-    use super::{write, Format, Transition, Zone};
+    use super::{write, Format, Transition, Transitions, Zone};
 
     fn formatted(format: &str, micros: i64, zone: &Zone) -> String {
         let mut out = Vec::new();
@@ -405,6 +377,43 @@ mod tests {
         assert_eq!(
             formatted("e|T|P|O|Z H:i", 0, &Zone::of(b"-05:00")),
             "-05:00|GMT-0500|-05:00|-0500|-18000 19:00"
+        );
+    }
+
+    struct Listed(Vec<Transition>);
+
+    impl Transitions for Listed {
+        type Error = &'static str;
+
+        fn of(&self, zone: &[u8], min_second: i64, max_second: i64) -> Result<Vec<Transition>, &'static str> {
+            assert_eq!(zone, b"Europe/Warsaw");
+            assert_eq!((min_second, max_second), (1_774_745_999, 1_792_890_000));
+
+            if self.0.is_empty() {
+                return Err("no transitions");
+            }
+
+            Ok(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn a_named_zone_resolves_through_the_transitions_it_is_given() {
+        let listed = Listed(vec![Transition {
+            from: 1_774_745_999,
+            offset: 3_600,
+            abbreviation: b"CET".to_vec(),
+        }]);
+        let mut warsaw = Zone::of(b"Europe/Warsaw");
+        let mut utc = Zone::Utc;
+
+        warsaw.resolve(1_774_745_999, 1_792_890_000, &listed).unwrap();
+        utc.resolve(0, 0, &Listed(vec![])).unwrap();
+
+        assert_eq!(formatted("T", 1_774_745_999_000_000, &warsaw), "CET");
+        assert_eq!(
+            Zone::of(b"Europe/Warsaw").resolve(1_774_745_999, 1_792_890_000, &Listed(vec![])),
+            Err("no transitions")
         );
     }
 

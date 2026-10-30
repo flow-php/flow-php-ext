@@ -1,14 +1,15 @@
 //! Arrow storage for one column kind, appended row by row and finished into the `ArrayData` whose data type is
-//! `flow_batch_frame::kind::data_type(kind)`. A null row is stored the canonical way: zeroed slot, offset not advanced,
-//! every structure child null.
+//! `kind::data_type(kind)`: `finish` copies the buffers and keeps the rows, `take` moves them out and keeps the
+//! capacity. A null row is stored the canonical way: zeroed slot, offset not advanced, every structure child null.
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Date32Type, DurationMicrosecondType, Float64Type, Int64Type, TimestampMicrosecondType};
 use arrow_array::Array;
-use arrow_buffer::{BooleanBufferBuilder, Buffer, NullBufferBuilder};
+use arrow_buffer::{BooleanBufferBuilder, Buffer, MutableBuffer, NullBufferBuilder};
 use arrow_data::ArrayData;
 use arrow_schema::ArrowError;
-use flow_batch_frame::kind::{data_type, Kind};
+
+use crate::kind::{data_type, Kind};
 
 /// List and map offsets are i32 (D5): the last offset a row would reach past `i32::MAX`. String offsets are i64.
 pub struct OffsetOverflow(pub u64);
@@ -17,9 +18,10 @@ pub enum KindBuilder {
     Null {
         len: usize,
     },
+    /// `values` is a `MutableBuffer`, not a `Vec<u8>`: arrow reads it as i64/f64/i32 words, which need their alignment.
     Fixed {
         width: usize,
-        values: Vec<u8>,
+        values: MutableBuffer,
         validity: NullBufferBuilder,
     },
     Boolean {
@@ -92,7 +94,7 @@ impl KindBuilder {
             },
             _ => KindBuilder::Fixed {
                 width: width(kind),
-                values: Vec::new(),
+                values: MutableBuffer::new(0),
                 validity: NullBufferBuilder::new(0),
             },
         }
@@ -107,6 +109,10 @@ impl KindBuilder {
             | KindBuilder::List { validity, .. }
             | KindBuilder::Map { validity, .. } => validity.len(),
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     pub fn append_null(&mut self) {
@@ -155,6 +161,18 @@ impl KindBuilder {
 
         values.extend_from_slice(bytes);
         validity.append_non_null();
+    }
+
+    pub fn append_i64(&mut self, value: i64) {
+        self.append_fixed(&value.to_le_bytes());
+    }
+
+    pub fn append_f64(&mut self, value: f64) {
+        self.append_fixed(&value.to_le_bytes());
+    }
+
+    pub fn append_i32(&mut self, value: i32) {
+        self.append_fixed(&value.to_le_bytes());
     }
 
     pub fn append_bool(&mut self, value: bool) {
@@ -358,6 +376,98 @@ impl KindBuilder {
         Ok(())
     }
 
+    /// The rows appended so far, their buffers moved into the array without a copy; the builder is left empty with
+    /// the capacity the rows took, so the next batch of the same size allocates nothing. The offsets are pushed
+    /// monotone by construction and every buffer is sized by the same appends, so the array is built unchecked; the
+    /// `arrow-validate` feature (`make test`) re-validates it.
+    pub fn take(&mut self, kind: &Kind) -> ArrayData {
+        let builder = ArrayData::builder(data_type(kind)).len(self.len());
+
+        let builder = match (self, kind) {
+            (KindBuilder::Null { len }, _) => {
+                *len = 0;
+
+                builder
+            }
+            (KindBuilder::Fixed { values, validity, .. }, _) => {
+                let taken = std::mem::replace(values, MutableBuffer::with_capacity(values.len()));
+
+                builder.nulls(validity.finish()).add_buffer(Buffer::from(taken))
+            }
+            (KindBuilder::Boolean { values, validity }, _) => {
+                let bits = values.finish();
+                *values = BooleanBufferBuilder::new(bits.len());
+
+                builder.nulls(validity.finish()).add_buffer(bits.into_inner())
+            }
+            (
+                KindBuilder::Bytes {
+                    offsets,
+                    data,
+                    validity,
+                },
+                _,
+            ) => builder
+                .nulls(validity.finish())
+                .add_buffer(Buffer::from_vec(taken_offsets(offsets)))
+                .add_buffer(Buffer::from_vec(taken(data))),
+            (
+                KindBuilder::List {
+                    offsets,
+                    validity,
+                    element,
+                },
+                Kind::List(field),
+            ) => builder
+                .nulls(validity.finish())
+                .add_buffer(Buffer::from_vec(taken_offsets(offsets)))
+                .add_child_data(element.take(&field.kind)),
+            (
+                KindBuilder::Map {
+                    offsets,
+                    validity,
+                    keys,
+                    values,
+                },
+                Kind::Map(key, value),
+            ) => {
+                let arrow_schema::DataType::Map(entries, _) = data_type(kind) else {
+                    unreachable!("a map kind has a map data type")
+                };
+                let entries = ArrayData::builder(entries.data_type().clone())
+                    .len(keys.len())
+                    .add_child_data(keys.take(&key.kind))
+                    .add_child_data(values.take(&value.kind));
+
+                builder
+                    .nulls(validity.finish())
+                    .add_buffer(Buffer::from_vec(taken_offsets(offsets)))
+                    .add_child_data(unsafe { entries.build_unchecked() })
+            }
+            (
+                KindBuilder::Struct {
+                    len,
+                    validity,
+                    children,
+                },
+                Kind::Struct(fields),
+            ) => {
+                *len = 0;
+
+                builder.nulls(validity.finish()).child_data(
+                    children
+                        .iter_mut()
+                        .zip(fields)
+                        .map(|(child, field)| child.take(&field.kind))
+                        .collect(),
+                )
+            }
+            _ => unreachable!("a builder is taken with the kind it was built for"),
+        };
+
+        unsafe { builder.build_unchecked() }
+    }
+
     /// The rows appended so far; the builder keeps them and may be appended to again.
     pub fn finish(&self, kind: &Kind) -> Result<ArrayData, ArrowError> {
         let builder = ArrayData::builder(data_type(kind)).len(self.len());
@@ -366,7 +476,7 @@ impl KindBuilder {
             (KindBuilder::Null { .. }, _) => builder,
             (KindBuilder::Fixed { values, validity, .. }, _) => builder
                 .nulls(validity.finish_cloned())
-                .add_buffer(Buffer::from_slice_ref(values)),
+                .add_buffer(Buffer::from_slice_ref(values.as_slice())),
             (KindBuilder::Boolean { values, validity }, _) => builder
                 .nulls(validity.finish_cloned())
                 .add_buffer(values.finish_cloned().into_inner()),
@@ -431,14 +541,27 @@ impl KindBuilder {
     }
 }
 
+/// `values` moved out, a vector of the same capacity left behind.
+fn taken<T>(values: &mut Vec<T>) -> Vec<T> {
+    std::mem::replace(values, Vec::with_capacity(values.len()))
+}
+
+/// `offsets` moved out, a vector of the same capacity holding the first offset `0` left behind.
+fn taken_offsets<T: From<u8>>(offsets: &mut Vec<T>) -> Vec<T> {
+    let mut next = Vec::with_capacity(offsets.len());
+    next.push(T::from(0));
+
+    std::mem::replace(offsets, next)
+}
+
 #[cfg(test)]
 mod tests {
     use arrow_array::cast::AsArray;
-    use arrow_array::types::Int64Type;
-    use arrow_array::{make_array, Array};
-    use flow_batch_frame::kind::{Field, Kind};
+    use arrow_array::types::{Float64Type, Int64Type};
+    use arrow_array::{make_array, Array, ArrayRef};
 
     use super::KindBuilder;
+    use crate::kind::{Field, Kind};
 
     fn field(kind: Kind) -> Box<Field> {
         Box::new(Field {
@@ -502,5 +625,137 @@ mod tests {
         );
         assert_eq!(structure.column(1).as_list::<i32>().values().len(), 1);
         assert_eq!(structure.column(2).as_map().keys().len(), 1);
+    }
+
+    fn nested() -> Kind {
+        Kind::Struct(vec![
+            Field {
+                name: "id".into(),
+                kind: Kind::Int64,
+                optional: true,
+            },
+            Field {
+                name: "ratio".into(),
+                kind: Kind::Float64,
+                optional: true,
+            },
+            Field {
+                name: "tags".into(),
+                kind: Kind::List(field(Kind::Bytes)),
+                optional: true,
+            },
+            Field {
+                name: "flags".into(),
+                kind: Kind::Map(field(Kind::Bytes), field(Kind::Boolean)),
+                optional: true,
+            },
+        ])
+    }
+
+    fn append_rows(builder: &mut KindBuilder, rows: &[(i64, &[u8])]) {
+        for (id, tag) in rows {
+            let children = builder.struct_children();
+            children[0].append_i64(*id);
+            children[1].append_f64(*id as f64 / 2.0);
+            children[2].list_element().append_bytes(tag);
+            children[2].end_entries().ok();
+            let (keys, values) = children[3].map_entries();
+            keys.append_bytes(tag);
+            values.append_bool(*id % 2 == 0);
+            children[3].end_entries().ok();
+            builder.end_struct();
+        }
+
+        builder.append_null();
+    }
+
+    #[test]
+    fn take_of_bytes_keeps_offsets_and_validity() {
+        let mut builder = KindBuilder::new(&Kind::Bytes);
+        builder.append_bytes(b"ab");
+        builder.append_null();
+        builder.append_bytes(b"");
+        builder.append_bytes(b"cde");
+
+        let array = make_array(builder.take(&Kind::Bytes));
+        let strings = array.as_binary::<i64>();
+
+        assert_eq!(strings.value_offsets(), &[0, 2, 2, 2, 5]);
+        assert_eq!(strings.value(0), b"ab");
+        assert!(strings.is_null(1));
+        assert_eq!(strings.value(2), b"");
+        assert_eq!(strings.value(3), b"cde");
+        assert_eq!(array.null_count(), 1);
+        assert!(builder.is_empty());
+    }
+
+    #[test]
+    fn take_leaves_capacity_for_the_next_batch() {
+        let kind = nested();
+        let mut builder = KindBuilder::new(&kind);
+        append_rows(&mut builder, &[(1, b"kept"), (2, b"also")]);
+
+        let first = make_array(builder.take(&kind));
+
+        assert_eq!(first.len(), 3);
+        assert!(builder.is_empty());
+
+        let KindBuilder::Struct { children, .. } = &builder else {
+            unreachable!("a structure builder")
+        };
+        let KindBuilder::Fixed { values, .. } = &children[0] else {
+            unreachable!("an int builder")
+        };
+        let KindBuilder::List { element, .. } = &children[2] else {
+            unreachable!("a list builder")
+        };
+        let KindBuilder::Bytes { offsets, data, .. } = element.as_ref() else {
+            unreachable!("a bytes builder")
+        };
+
+        assert!(values.capacity() >= 3 * 8);
+        assert_eq!(offsets.as_slice(), &[0]);
+        assert_eq!(offsets.capacity(), 3);
+        assert_eq!(data.capacity(), 8);
+    }
+
+    #[test]
+    fn take_twice_yields_two_independent_arrays() {
+        let kind = nested();
+        let mut builder = KindBuilder::new(&kind);
+        append_rows(&mut builder, &[(1, b"first")]);
+        let first = make_array(builder.take(&kind));
+        append_rows(&mut builder, &[(2, b"second"), (3, b"third")]);
+        let second = make_array(builder.take(&kind));
+
+        let ids = |array: &ArrayRef| {
+            array
+                .as_struct()
+                .column(0)
+                .as_primitive::<Int64Type>()
+                .iter()
+                .collect::<Vec<_>>()
+        };
+        let tags = |array: &ArrayRef| {
+            let list = array.as_struct().column(2).as_list::<i32>();
+
+            (0..list.len())
+                .filter(|row| !list.is_null(*row))
+                .map(|row| list.value(row).as_binary::<i64>().value(0).to_vec())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(ids(&first), vec![Some(1), None]);
+        assert_eq!(ids(&second), vec![Some(2), Some(3), None]);
+        assert_eq!(tags(&first), vec![b"first".to_vec()]);
+        assert_eq!(tags(&second), vec![b"second".to_vec(), b"third".to_vec()]);
+        assert_eq!(
+            first.as_struct().column(1).as_primitive::<Float64Type>().values(),
+            &[0.5, 0.0]
+        );
+        assert_eq!(
+            second.as_struct().column(3).as_map().keys().as_binary::<i64>().value(1),
+            b"third"
+        );
     }
 }

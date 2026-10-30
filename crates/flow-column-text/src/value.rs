@@ -11,15 +11,12 @@ use arrow_array::{
     LargeBinaryArray, ListArray, MapArray, TimestampMicrosecondArray,
 };
 use arrow_buffer::NullBuffer;
-use ext_php_rs::exception::PhpException;
-use flow_batch_frame::kind::Kind;
+use flow_batch_frame::key::array_key_index;
+use flow_batch_frame::kind::{Kind, ValueNode};
 
-use crate::ctx::array_key_index;
-use crate::plan::ValueNode;
-use crate::text::date::{self, Format, Zone};
-use crate::text::json::{self, Flags};
-use crate::text::{float, int, Error};
-use crate::values::push_uuid_text;
+use crate::date::{self, Format, Transitions, Zone};
+use crate::json::{self, Flags};
+use crate::{float, int, uuid, Error};
 
 /// The writer's datetime and date formats; `None` holds a letter the native lane does not render.
 pub struct Formats {
@@ -85,14 +82,14 @@ pub struct Renderer<'a> {
 
 /// Whether the native lane renders a column of `node`. Not rendered: markup; json unless it is the column itself and
 /// the format writes its stored text; a datetime or date whose format did not parse; a container holding any of those.
-pub fn renders(node: &ValueNode, formats: &Formats, json_column_is_text: bool) -> bool {
+pub fn renders<M>(node: &ValueNode<M>, formats: &Formats, json_column_is_text: bool) -> bool {
     match node {
         ValueNode::Json => json_column_is_text,
         _ => renders_nested(node, formats),
     }
 }
 
-fn renders_nested(node: &ValueNode, formats: &Formats) -> bool {
+fn renders_nested<M>(node: &ValueNode<M>, formats: &Formats) -> bool {
     match node {
         ValueNode::Plain
         | ValueNode::Null
@@ -110,7 +107,7 @@ fn renders_nested(node: &ValueNode, formats: &Formats) -> bool {
 
 impl<'a> Renderer<'a> {
     /// `None` for a column `renders()` refuses. A named zone still has to be resolved: [`Renderer::resolve`].
-    pub fn new(node: &ValueNode, kind: &'a Kind, array: &'a dyn Array, formats: &'a Formats) -> Option<Self> {
+    pub fn new<M>(node: &ValueNode<M>, kind: &'a Kind, array: &'a dyn Array, formats: &'a Formats) -> Option<Self> {
         let values = match (node, kind) {
             (_, Kind::Null) | (ValueNode::Null, _) => Values::Null,
             (ValueNode::DateTime(zone), Kind::Timestamp) => Values::Instant {
@@ -179,19 +176,25 @@ impl<'a> Renderer<'a> {
         })
     }
 
-    /// Every named zone reads its transitions over the instants it renders, once per batch.
-    pub fn resolve(&mut self) -> Result<(), PhpException> {
+    /// Every named zone takes its transitions over the instants it renders, once per batch.
+    pub fn resolve<T: Transitions>(&mut self, transitions: &T) -> Result<(), T::Error> {
         match &mut self.values {
             Values::Instant { array, zone, .. } => {
                 if let (Some(earliest), Some(latest)) = (array.iter().flatten().min(), array.iter().flatten().max()) {
-                    zone.resolve(earliest.div_euclid(1_000_000), latest.div_euclid(1_000_000))?;
+                    zone.resolve(
+                        earliest.div_euclid(1_000_000),
+                        latest.div_euclid(1_000_000),
+                        transitions,
+                    )?;
                 }
 
                 Ok(())
             }
-            Values::List { element, .. } => element.resolve(),
-            Values::Map { values, .. } => values.resolve(),
-            Values::Struct(fields) => fields.iter_mut().try_for_each(|(_, _, field)| field.resolve()),
+            Values::List { element, .. } => element.resolve(transitions),
+            Values::Map { values, .. } => values.resolve(transitions),
+            Values::Struct(fields) => fields
+                .iter_mut()
+                .try_for_each(|(_, _, field)| field.resolve(transitions)),
             _ => Ok(()),
         }
     }
@@ -226,7 +229,7 @@ impl<'a> Renderer<'a> {
             Values::Float(array) => float::text(out, array.value(i)),
             Values::Bool(array) => out.extend_from_slice(if array.value(i) { b"true" } else { b"false" }),
             Values::Bytes(array) => out.extend_from_slice(array.value(i)),
-            Values::Uuid(array) => push_uuid_text(out, array.value(i)),
+            Values::Uuid(array) => uuid(out, array.value(i)),
             Values::Instant { array, format, zone } => date::write(out, format, array.value(i), zone),
             Values::Days { array, format } => {
                 date::write(out, format, i64::from(array.value(i)) * 86_400_000_000, &Zone::Utc)
@@ -268,7 +271,7 @@ impl<'a> Renderer<'a> {
             Values::Bytes(array) => json::string(out, array.value(i), flags)?,
             Values::Uuid(array) => {
                 out.push(b'"');
-                push_uuid_text(out, array.value(i));
+                uuid(out, array.value(i));
                 out.push(b'"');
             }
             Values::Instant { .. } | Values::Days { .. } => {
@@ -405,13 +408,12 @@ mod tests {
     use arrow_array::types::Int64Type;
     use arrow_array::{Array, ArrayRef, Int64Array, ListArray, StructArray};
     use arrow_schema::{DataType, Field as ArrowField};
-    use flow_batch_frame::kind::{Field, Kind};
+    use flow_batch_frame::kind::{Field, Kind, ValueNode};
 
     use super::{Formats, Renderer};
-    use crate::plan::ValueNode;
-    use crate::text::json::Flags;
+    use crate::json::Flags;
 
-    fn json(node: &ValueNode, kind: &Kind, array: &dyn Array, row: usize) -> String {
+    fn json(node: &ValueNode<()>, kind: &Kind, array: &dyn Array, row: usize) -> String {
         let formats = Formats::parse(b"Y-m-d\\TH:i:sP", b"Y-m-d");
         let mut out = Vec::new();
         let mut non_finite = false;

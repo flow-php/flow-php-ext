@@ -1,6 +1,6 @@
 //! `php_json_escape_string()` (ext/json/json_encoder.c) for the flags the native JSON writer accepts.
 
-use crate::text::Error;
+use crate::Error;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Flags {
@@ -89,7 +89,7 @@ fn ascii(out: &mut Vec<u8>, byte: u8, flags: &Flags) {
 #[cfg(test)]
 mod tests {
     use super::{string, Flags};
-    use crate::text::Error;
+    use crate::Error;
 
     fn escaped(text: &[u8], flags: &Flags) -> Result<String, Error> {
         let mut out = Vec::new();

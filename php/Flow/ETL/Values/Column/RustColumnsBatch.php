@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Flow\ETL\Column;
+namespace Flow\ETL\Values\Column;
 
 use RuntimeException;
 
@@ -13,7 +13,7 @@ if (extension_loaded('flow_php')) {
 }
 
 /**
- * One Arrow C Data struct array and its schema; built by Flow\ETL\Adapter\Parquet\RustParquetOpenSink::write(), never
+ * One Arrow C Data struct array and its schema; built by Flow\ETL\Adapter\Parquet\IO\Loader\RustParquetFileWriter::write(), never
  * by userland.
  */
 final class RustColumnsBatch

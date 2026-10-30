@@ -2,12 +2,12 @@
 
 declare(strict_types=1);
 
-namespace Flow\ETL\Adapter\JSON;
+namespace Flow\ETL\Adapter\JSON\IO\Extractor;
 
-use Flow\ETL\Column\Backend;
-use Flow\ETL\Rows;
-use Flow\ETL\RustIterator;
-use Flow\ETL\Schema;
+use Flow\ETL\Values\Column\Backend;
+use Flow\ETL\Values\Rows;
+use Flow\ETL\Values\RustIterator;
+use Flow\ETL\Values\Schema;
 use Flow\Filesystem\SourceStream;
 use RuntimeException;
 

@@ -2,10 +2,10 @@
 
 declare(strict_types=1);
 
-namespace Flow\ETL\Adapter\JSON;
+namespace Flow\ETL\Adapter\JSON\IO\Loader;
 
-use Flow\ETL\Exception\InvalidArgumentException;
-use Flow\ETL\Rows;
+use Flow\ETL\Foundation\Exception\InvalidArgumentException;
+use Flow\ETL\Values\Rows;
 use RuntimeException;
 
 use function extension_loaded;
@@ -21,7 +21,7 @@ final class RustJsonEncoder implements JsonEncoder
      *
      * @throws InvalidArgumentException a flag outside JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION
      */
-    public function __construct(int $flags, string $dateTimeFormat, string $dateFormat, PhpJsonEncoder $php)
+    public function __construct(PhpJsonEncoder $php)
     {
         throw new RuntimeException('flow_php extension is not loaded');
     }

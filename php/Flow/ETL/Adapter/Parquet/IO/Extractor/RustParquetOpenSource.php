@@ -2,12 +2,12 @@
 
 declare(strict_types=1);
 
-namespace Flow\ETL\Adapter\Parquet;
+namespace Flow\ETL\Adapter\Parquet\IO\Extractor;
 
-use Flow\ETL\Column\Backend;
-use Flow\ETL\Rows;
-use Flow\ETL\RustIterator;
-use Flow\ETL\Schema;
+use Flow\ETL\Values\Column\Backend;
+use Flow\ETL\Values\Rows;
+use Flow\ETL\Values\RustIterator;
+use Flow\ETL\Values\Schema;
 use Flow\Parquet\Engine\RustParquetFileReader;
 use Flow\Parquet\Reader\ReadPlan;
 use RuntimeException;
@@ -26,7 +26,7 @@ final class RustParquetOpenSource implements ParquetOpenSource
     }
 
     /**
-     * @throws \Flow\ETL\Exception\InvalidArgumentException for a column whose type stores something other than the
+     * @throws \Flow\ETL\Foundation\Exception\InvalidArgumentException for a column whose type stores something other than the
      *                                                      file's column reads as, before any batch
      *
      * @return RustIterator<Rows>

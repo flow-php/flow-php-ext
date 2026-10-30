@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Flow\ETL;
+namespace Flow\ETL\Values;
 
 use Iterator;
 use RuntimeException;
@@ -14,7 +14,7 @@ if (extension_loaded('flow_php')) {
 }
 
 /**
- * Streams once: rewind() after next() throws \Flow\ETL\Exception\RuntimeException('RustIterator cannot rewind').
+ * Streams once: rewind() after next() throws \Flow\ETL\Foundation\Exception\RuntimeException('RustIterator cannot rewind').
  *
  * @template-covariant T
  *
