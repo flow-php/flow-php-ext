@@ -5,7 +5,8 @@
 
 use std::rc::Rc;
 
-use arrow_array::{make_array, ArrayRef};
+use arrow_array::{make_array, ArrayRef, UInt32Array};
+use arrow_select::take::take;
 
 use ext_php_rs::binary::Binary;
 use ext_php_rs::boxed::ZBox;
@@ -18,24 +19,34 @@ use flow_batch_frame::column::decode;
 use flow_batch_frame::frame;
 use flow_batch_frame::kind::Kind;
 use flow_batch_frame::layout::buffer_count;
+use flow_column_kernels::arithmetic::Operator;
+use flow_column_kernels::compare::{is_not_null, is_null};
 
+use crate::arithmetic::{native_arithmetic, native_modulo};
 use crate::batch_columns::HeldBatch;
 use crate::builder::{throw, RustColumnBuilder};
 use crate::column::RustColumn;
+use crate::compare::{boolean_column, native_comparison};
 use crate::ctx::{
     call_handle_catching, call_method, call_static, ce_method_ref, column_key, construct, expect_object, find_class,
-    ht_for_each, ht_get, ht_insert, transparent_exception, zval_long, zval_str,
+    ht_for_each, ht_get, ht_insert, instance, transparent_exception, zval_long, zval_str,
 };
 use crate::exception::ext_exception;
 use crate::frame::{string_of, FrameBody, PhpCodec};
+use crate::group_table::RustGroupTable;
+use crate::grouped_counts::RustGroupedCounts;
+use crate::grouped_totals::RustGroupedTotals;
 use crate::interfaces::{backend_ce, describable_ce};
 use crate::plan::{physical_for_definition, type_plan, TypePlan};
 use crate::render::{decode_exception, encode_exception, floe_exception, frame_exception, invalid_argument};
+use crate::sort::native_sort;
 
 const COLUMN_MISMATCH: &str = "Flow\\ETL\\Foundation\\Exception\\ColumnMismatchException";
 const DESCRIPTION: &str = "Flow\\ETL\\Foundation\\Describe\\Description";
+const DEFINITIONS: &str = "Flow\\ETL\\Values\\Schema\\Definitions";
 const MIXED_TYPE: &str = "Flow\\Types\\Type\\Native\\MixedType";
 const ROWS: &str = "Flow\\ETL\\Values\\Rows";
+const PHP_BACKEND: &str = "Flow\\ETL\\Values\\Column\\PhpBackend";
 const RUST_BACKEND: &str = "Flow\\ETL\\Values\\Column\\RustBackend";
 const SCHEMA_MISMATCH: &str = "Flow\\ETL\\Foundation\\Exception\\SchemaMismatchException";
 
@@ -152,11 +163,116 @@ impl RustBackend {
     }
 
     pub fn constant(&self, definition: &Zval, value: &Zval, count: i64) -> PhpResult<RustColumn> {
+        let count = rows(count, "constant count")?;
         let mut builder = self.builder(definition)?;
         let pending = builder.pending(value)?;
 
-        builder.append_repeated(pending, rows(count, "constant count")?)?;
-        builder.finish_column()
+        builder.append_pending(pending)?;
+        let one = builder.finish_column()?;
+        // one native gather of row 0, not `count` appends
+        let repeated = take(one.data().as_ref(), &UInt32Array::from(vec![0; count as usize]), None)
+            .map_err(|e| invalid_argument(format!("flow_php failed to repeat a constant: {e}")))?;
+
+        Ok(RustColumn::new(repeated, Rc::clone(one.plan())))
+    }
+
+    pub fn compare(
+        &self,
+        left: &Zval,
+        operator: &Zval,
+        right: &Zval,
+        leftName: &Zval,
+        rightName: &Zval,
+    ) -> PhpResult<ColumnValue> {
+        match native_comparison(left, operator, right)? {
+            Some(compared) => Ok(ColumnValue(compared.into_zval(false)?)),
+            None => self.adopt_result(call_method(
+                &instance(PHP_BACKEND)?,
+                "compare",
+                &mut [
+                    left.shallow_clone(),
+                    operator.shallow_clone(),
+                    right.shallow_clone(),
+                    leftName.shallow_clone(),
+                    rightName.shallow_clone(),
+                ],
+            )?),
+        }
+    }
+
+    pub fn add(&self, left: &Zval, right: &Zval) -> PhpResult<ColumnValue> {
+        self.arithmetic(left, Operator::Add, right, "add")
+    }
+
+    pub fn subtract(&self, left: &Zval, right: &Zval) -> PhpResult<ColumnValue> {
+        self.arithmetic(left, Operator::Subtract, right, "subtract")
+    }
+
+    pub fn multiply(&self, left: &Zval, right: &Zval) -> PhpResult<ColumnValue> {
+        self.arithmetic(left, Operator::Multiply, right, "multiply")
+    }
+
+    pub fn modulo(&self, left: &Zval, right: &Zval) -> PhpResult<ColumnValue> {
+        match native_modulo(left, right)? {
+            Some(result) => Ok(ColumnValue(result.into_zval(false)?)),
+            None => self.adopt_result(call_method(
+                &instance(PHP_BACKEND)?,
+                "modulo",
+                &mut [left.shallow_clone(), right.shallow_clone()],
+            )?),
+        }
+    }
+
+    pub fn sort(&self, rows: &Zval, columns: &Zval) -> PhpResult<RowsValue> {
+        match native_sort(rows, columns)? {
+            Some(sorted) => Ok(RowsValue(sorted)),
+            None => Ok(RowsValue(call_method(
+                &instance(PHP_BACKEND)?,
+                "sort",
+                &mut [rows.shallow_clone(), columns.shallow_clone()],
+            )?)),
+        }
+    }
+
+    #[php(name = "groupedTotals")]
+    pub fn grouped_totals(&self) -> RustGroupedTotals {
+        RustGroupedTotals::default()
+    }
+
+    #[php(name = "groupedCounts")]
+    pub fn grouped_counts(&self) -> RustGroupedCounts {
+        RustGroupedCounts::default()
+    }
+
+    #[php(name = "groupTable")]
+    pub fn group_table(&self, columns: &ZendHashTable, declared: &Zval) -> PhpResult<RustGroupTable> {
+        RustGroupTable::new(columns, declared)
+    }
+
+    #[php(name = "isNull")]
+    pub fn is_null(&self, column: &Zval) -> PhpResult<ColumnValue> {
+        match column.extract::<&RustColumn>() {
+            Some(native) => Ok(ColumnValue(boolean_column(is_null(native.data()))?.into_zval(false)?)),
+            None => self.adopt_result(call_method(
+                &instance(PHP_BACKEND)?,
+                "isNull",
+                &mut [column.shallow_clone()],
+            )?),
+        }
+    }
+
+    #[php(name = "isNotNull")]
+    pub fn is_not_null(&self, column: &Zval) -> PhpResult<ColumnValue> {
+        match column.extract::<&RustColumn>() {
+            Some(native) => Ok(ColumnValue(
+                boolean_column(is_not_null(native.data()))?.into_zval(false)?,
+            )),
+            None => self.adopt_result(call_method(
+                &instance(PHP_BACKEND)?,
+                "isNotNull",
+                &mut [column.shallow_clone()],
+            )?),
+        }
     }
 
     pub fn decode(
@@ -326,13 +442,13 @@ impl Adoption {
 }
 
 /// What `Rows::fromColumns()` left instead of rows: the exception it threw, or why it could not be called.
-enum NoRows {
+pub enum NoRows {
     Thrown(ZBox<ZendObject>),
     Unreachable(PhpException),
 }
 
 impl NoRows {
-    fn surfaced(self) -> PhpException {
+    pub fn surfaced(self) -> PhpException {
         match self {
             NoRows::Thrown(mut exception) => transparent_exception(&mut exception),
             NoRows::Unreachable(e) => e,
@@ -341,7 +457,7 @@ impl NoRows {
 }
 
 /// `Rows::fromColumns($schema, $columns, $count)`.
-fn rows_from_columns(schema: &Zval, columns: ZBox<ZendHashTable>, count: usize) -> Result<Zval, NoRows> {
+pub fn rows_from_columns(schema: &Zval, columns: ZBox<ZendHashTable>, count: usize) -> Result<Zval, NoRows> {
     let mut columns_zv = Zval::new();
     columns_zv.set_hashtable(columns);
     let from_columns = find_class(ROWS)
@@ -396,4 +512,31 @@ pub fn native_column(definition: &Zval, column: &Zval) -> PhpResult<(Rc<TypePlan
     };
 
     Ok((Rc::clone(native.plan()), ArrayRef::clone(native.data())))
+}
+
+impl RustBackend {
+    fn adopt_result(&self, column: Zval) -> PhpResult<ColumnValue> {
+        let definition = call_static(
+            DEFINITIONS,
+            "of",
+            &mut [
+                zval_str(b"value"),
+                call_method(&column, "type", &mut [])?,
+                Zval::from(true),
+            ],
+        )?;
+
+        self.adopt(&definition, &column)
+    }
+
+    fn arithmetic(&self, left: &Zval, operator: Operator, right: &Zval, method: &str) -> PhpResult<ColumnValue> {
+        match native_arithmetic(left, operator, right)? {
+            Some(result) => Ok(ColumnValue(result.into_zval(false)?)),
+            None => self.adopt_result(call_method(
+                &instance(PHP_BACKEND)?,
+                method,
+                &mut [left.shallow_clone(), right.shallow_clone()],
+            )?),
+        }
+    }
 }

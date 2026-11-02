@@ -54,12 +54,20 @@ impl RustColumn {
         Self { data, plan }
     }
 
+    pub fn of_type(data: ArrayRef, type_class: &'static str) -> Result<Self, PhpException> {
+        Ok(Self::new(data, type_plan(&instance(type_class)?)?))
+    }
+
     pub fn data(&self) -> &ArrayRef {
         &self.data
     }
 
     pub fn plan(&self) -> &Rc<TypePlan> {
         &self.plan
+    }
+
+    pub fn is_null_at(&self, row: usize) -> bool {
+        matches!(self.kind(), Kind::Null) || self.data.is_null(row)
     }
 
     fn kind(&self) -> &Kind {
@@ -219,9 +227,7 @@ impl RustColumn {
 
     #[php(name = "isNull")]
     pub fn is_null(&self, i: i64) -> PhpResult<bool> {
-        let row = self.row(i)?;
-
-        Ok(matches!(self.kind(), Kind::Null) || self.data.is_null(row))
+        Ok(self.is_null_at(self.row(i)?))
     }
 
     #[php(name = "nullCount")]
