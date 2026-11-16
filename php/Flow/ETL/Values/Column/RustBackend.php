@@ -50,6 +50,11 @@ final class RustBackend implements Backend, Describable
         throw new RuntimeException('flow_php extension is not loaded');
     }
 
+    public function releaseFreedMemory(): void
+    {
+        throw new RuntimeException('flow_php extension is not loaded');
+    }
+
     public function builder(Definition $definition): ColumnBuilder
     {
         throw new RuntimeException('flow_php extension is not loaded');
@@ -91,6 +96,21 @@ final class RustBackend implements Backend, Describable
     }
 
     public function modulo(Column $left, Column $right): Column
+    {
+        throw new RuntimeException('flow_php extension is not loaded');
+    }
+
+    public function startsWith(Column $haystack, Column $needle): Column
+    {
+        throw new RuntimeException('flow_php extension is not loaded');
+    }
+
+    public function endsWith(Column $haystack, Column $needle): Column
+    {
+        throw new RuntimeException('flow_php extension is not loaded');
+    }
+
+    public function contains(Column $haystack, Column $needle): Column
     {
         throw new RuntimeException('flow_php extension is not loaded');
     }

@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use ahash::AHashMap;
 
-use arrow_array::{make_array, ArrayRef, UInt32Array};
+use arrow_array::{make_array, ArrayRef, BooleanArray, LargeBinaryArray, UInt32Array};
 use arrow_select::take::take;
 
 use ext_php_rs::binary::Binary;
@@ -17,20 +17,20 @@ use ext_php_rs::convert::IntoZval;
 use ext_php_rs::error::Result as ZvalResult;
 use ext_php_rs::flags::{ClassFlags, DataType};
 use ext_php_rs::prelude::*;
-use ext_php_rs::types::{ZendHashTable, ZendObject, Zval};
+use ext_php_rs::types::{ZendCallable, ZendHashTable, ZendObject, Zval};
 use flow_batch_frame::column::decode;
 use flow_batch_frame::frame;
 use flow_batch_frame::kind::Kind;
 use flow_batch_frame::layout::buffer_count;
 use flow_column_kernels::arithmetic::Operator;
-use flow_column_kernels::compare::{is_not_null, is_null};
+use flow_column_kernels::compare::{contains, ends_with, is_not_null, is_null, starts_with};
 use flow_column_kernels::grouping::{append_text_key, bucket_of};
 
 use crate::arithmetic::{native_arithmetic, native_modulo};
 use crate::batch_columns::HeldBatch;
 use crate::builder::{throw, RustColumnBuilder};
 use crate::column::RustColumn;
-use crate::compare::{boolean_column, native_comparison};
+use crate::compare::{boolean_column, native_comparison, native_text_match};
 use crate::ctx::{
     call_handle_catching, call_method, call_static, ce_method_ref, column_key, construct, expect_object, find_class,
     ht_for_each, ht_get, ht_insert, ht_insert_long, instance, transparent_exception, zval_long, zval_str,
@@ -237,6 +237,20 @@ impl RustBackend {
                 &mut [left.shallow_clone(), right.shallow_clone()],
             )?),
         }
+    }
+
+    #[php(name = "startsWith")]
+    pub fn starts_with(&self, haystack: &Zval, needle: &Zval) -> PhpResult<ColumnValue> {
+        self.text_match(haystack, needle, starts_with, "startsWith")
+    }
+
+    #[php(name = "endsWith")]
+    pub fn ends_with(&self, haystack: &Zval, needle: &Zval) -> PhpResult<ColumnValue> {
+        self.text_match(haystack, needle, ends_with, "endsWith")
+    }
+
+    pub fn contains(&self, haystack: &Zval, needle: &Zval) -> PhpResult<ColumnValue> {
+        self.text_match(haystack, needle, contains, "contains")
     }
 
     pub fn sort(&self, rows: &Zval, columns: &Zval) -> PhpResult<RowsValue> {
@@ -531,18 +545,33 @@ impl RustBackend {
 
     #[php(name = "allocatedBytes")]
     pub fn allocated_bytes(&self) -> i64 {
-        crate::alloc::allocated_bytes()
+        crate::alloc::own_bytes() + arrow_bytes()
     }
 
+    /// The arrow bytes count as they are now, not at their own peak: they are another allocator's.
     #[php(name = "allocatedPeakBytes")]
     pub fn allocated_peak_bytes(&self) -> i64 {
-        crate::alloc::allocated_peak_bytes()
+        crate::alloc::own_peak_bytes() + arrow_bytes()
     }
 
     #[php(name = "resetAllocatedPeak")]
     pub fn reset_allocated_peak(&self) {
         crate::alloc::reset_peak();
     }
+
+    #[php(name = "releaseFreedMemory")]
+    pub fn release_freed_memory(&self) {
+        crate::alloc::release_freed();
+    }
+}
+
+/// The arrow extension's bytes, else the imported batches alone: an imported batch is arrow's memory, so never both.
+fn arrow_bytes() -> i64 {
+    ZendCallable::try_from_name("Flow\\Arrow\\allocated_bytes")
+        .ok()
+        .and_then(|callable| callable.try_call(vec![]).ok())
+        .and_then(|bytes| bytes.long())
+        .unwrap_or_else(flow_arrow_c::imported_bytes)
 }
 
 /// The schema and backend every batch of one source is adopted under.
@@ -674,6 +703,23 @@ impl RustBackend {
         )?;
 
         self.adopt(&definition, &column)
+    }
+
+    fn text_match(
+        &self,
+        haystack: &Zval,
+        needle: &Zval,
+        kernel: fn(&LargeBinaryArray, &LargeBinaryArray) -> BooleanArray,
+        method: &str,
+    ) -> PhpResult<ColumnValue> {
+        match native_text_match(haystack, needle, kernel)? {
+            Some(matched) => Ok(ColumnValue(matched.into_zval(false)?)),
+            None => self.adopt_result(call_method(
+                &instance(PHP_BACKEND)?,
+                method,
+                &mut [haystack.shallow_clone(), needle.shallow_clone()],
+            )?),
+        }
     }
 
     fn arithmetic(&self, left: &Zval, operator: Operator, right: &Zval, method: &str) -> PhpResult<ColumnValue> {
