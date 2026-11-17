@@ -1,0 +1,1266 @@
+//! `Flow\Parquet\Engine\{RustParquetFileReader, RustParquetFooter, RustParquetFileWriter}` and `Flow\Arrow\Parquet\RustColumnsReader`: the
+//! `flow-php/parquet` lib's values over the core -
+//! one footer read per file, columns as lists of the values `PhpParquetEngine` returns, rows written as it accepts
+//! them, and struct batches written as another extension exports them.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use arrow_array::{new_null_array, ArrayRef};
+use ext_php_rs::convert::IntoZval;
+use ext_php_rs::error::Result as ZvalResult;
+use ext_php_rs::flags::{ClassFlags, DataType};
+use ext_php_rs::prelude::*;
+use ext_php_rs::types::{ZendClassObject, ZendHashTable, ZendObject, Zval};
+use ext_php_rs::zend::ce;
+use parquet::arrow::ArrowSchemaConverter;
+use parquet::basic::Type as PhysicalType;
+use parquet::file::metadata::ParquetMetaData;
+
+use crate::cells::{Checked, Classes, ReadCell, Refusal, Scalar, Times, Validated, WriteColumn};
+use crate::chunks::chunk_spans;
+use crate::error::Error;
+use crate::filter::Raw;
+use crate::footer::Footer;
+use crate::interfaces::{footer_ce, parquet_file_reader_ce, parquet_file_writer_ce};
+use crate::lib_calls::{
+    call_static, METADATA_FROM_THRIFT, READ_PLAN_TO_EXTENSION, ROW_GROUP_CHUNKS_DECODED, ROW_GROUP_CHUNKS_FROM_THRIFT,
+    SCHEMA_FROM_THRIFT,
+};
+use crate::options;
+use crate::php::{
+    call_handle, call_method, ce_method_ref, expect_object, find_class, for_each_value, ht_for_each, ht_get, ht_insert,
+    ht_insert_long, read_property, zval_array, zval_long, zval_str, IterableArg,
+};
+use crate::read::{ParquetReader, ReadPlan};
+use crate::render::{exception, parquet_exception, Side};
+use crate::sink::PhpSink;
+use crate::source::{PhpSource, PhpStream};
+use crate::thrift;
+use crate::write::ParquetWriter;
+
+const FILE_META_DATA: &str = "Flow\\Parquet\\ThriftModel\\FileMetaData";
+/// `FileMetaData::$schema`'s field id.
+const SCHEMA: i16 = 2;
+const RUNTIME: &str = "Flow\\Parquet\\Exception\\RuntimeException";
+const SKIPPED_MATCHES: &str = "Flow\\Parquet\\Reader\\SkippedMatches";
+pub const INVALID_ARGUMENT: &str = "Flow\\Parquet\\Exception\\InvalidArgumentException";
+
+fn closed() -> PhpException {
+    exception(RUNTIME, "Reader is not open".to_string())
+}
+
+/// `ParquetFileReader::metadata()`'s return, typed `Flow\Parquet\ParquetFile\Metadata`.
+pub struct MetadataObject(Zval);
+
+impl IntoZval for MetadataObject {
+    const TYPE: DataType = DataType::object("Flow\\Parquet\\ParquetFile\\Metadata");
+    const NULLABLE: bool = false;
+
+    fn set_zval(self, zv: &mut Zval, _persistent: bool) -> ZvalResult<()> {
+        *zv = self.0;
+
+        Ok(())
+    }
+}
+
+/// `ParquetFileReader::schema()`'s return, typed `Flow\Parquet\ParquetFile\Schema`.
+pub struct SchemaObject(Zval);
+
+impl IntoZval for SchemaObject {
+    const TYPE: DataType = DataType::object("Flow\\Parquet\\ParquetFile\\Schema");
+    const NULLABLE: bool = false;
+
+    fn set_zval(self, zv: &mut Zval, _persistent: bool) -> ZvalResult<()> {
+        *zv = self.0;
+
+        Ok(())
+    }
+}
+
+/// `ParquetFileReader::rowGroupChunks()`'s return, a `Flow\Parquet\Engine\Arrow\RustRowGroupChunks` typed as the
+/// interface: a covariant userland return type cannot be checked when the class registers.
+pub struct RowGroupChunksObject(Zval);
+
+impl IntoZval for RowGroupChunksObject {
+    const TYPE: DataType = DataType::object("Flow\\Parquet\\ParquetFile\\RowGroupChunks");
+    const NULLABLE: bool = false;
+
+    fn set_zval(self, zv: &mut Zval, _persistent: bool) -> ZvalResult<()> {
+        *zv = self.0;
+
+        Ok(())
+    }
+}
+
+/// `$plan` (a `Flow\Parquet\Reader\ReadPlan`) through `ReadPlanConverter::toExtension()`, checked against `meta`.
+pub fn read_plan(meta: &ParquetMetaData, plan: &Zval, stream: &PhpStream) -> PhpResult<ReadPlan> {
+    let converted = call_static(READ_PLAN_TO_EXTENSION, &mut [plan.shallow_clone()])?;
+
+    converted_plan(meta, &converted).map_err(|error| parquet_exception(error, stream, Side::Read))
+}
+
+fn converted_plan(meta: &ParquetMetaData, converted: &Zval) -> Result<ReadPlan, Error> {
+    let malformed = |what: &str| Error::Plan(format!("arrow received a malformed read plan: {what}"));
+    let converted = converted.array().ok_or_else(|| malformed("not an array"))?;
+    let planned = selectors(converted, b"selectors")?;
+    let matched = selectors(converted, b"matched")?;
+
+    let limit = match ht_get(converted, b"limit") {
+        Some(limit) if limit.is_null() => None,
+        Some(limit) => Some(
+            limit
+                .long()
+                .and_then(|limit| usize::try_from(limit).ok())
+                .ok_or_else(|| malformed("'limit' is not an int of 0 or more"))?,
+        ),
+        None => return Err(malformed("no 'limit'")),
+    };
+    let offset = ht_get(converted, b"offset")
+        .and_then(Zval::long)
+        .and_then(|offset| usize::try_from(offset).ok())
+        .ok_or_else(|| malformed("'offset' is not an int of 0 or more"))?;
+    let filter = ht_get(converted, b"filter").map(raw).transpose()?;
+
+    let plan = ReadPlan::from_selection(meta, planned.clone(), filter, limit)?;
+
+    Ok(ReadPlan {
+        offset,
+        proven: plan.proven_by(meta, &planned, &matched),
+        ..plan
+    })
+}
+
+fn selectors(converted: &ZendHashTable, key: &[u8]) -> Result<Vec<(usize, bool)>, Error> {
+    let malformed = |what: &str| Error::Plan(format!("arrow received a malformed read plan: {what}"));
+    let selectors = ht_get(converted, key)
+        .and_then(Zval::array)
+        .ok_or_else(|| malformed(&format!("no '{}' list", String::from_utf8_lossy(key))))?;
+    let mut planned = Vec::with_capacity(selectors.len());
+
+    ht_for_each(selectors, |_, _, selector| {
+        let selector = selector
+            .array()
+            .ok_or_else(|| malformed("a selector is not an array"))?;
+        let count = selector
+            .get_index(0)
+            .and_then(Zval::long)
+            .and_then(|count| usize::try_from(count).ok())
+            .ok_or_else(|| malformed("a selector's row count is not an int of 0 or more"))?;
+        let skip = selector
+            .get_index(1)
+            .and_then(Zval::bool)
+            .ok_or_else(|| malformed("a selector's skip is not a bool"))?;
+
+        planned.push((count, skip));
+
+        Ok::<(), Error>(())
+    })?;
+
+    Ok(planned)
+}
+
+/// A converter array as data: a map keyed by its keys' bytes when a key is a string, else a list of its values.
+fn raw(value: &Zval) -> Result<Raw, Error> {
+    if value.is_null() {
+        return Ok(Raw::Null);
+    }
+
+    if let Some(value) = value.bool() {
+        return Ok(Raw::Bool(value));
+    }
+
+    if let Some(value) = value.long() {
+        return Ok(Raw::Int(value));
+    }
+
+    if let Some(value) = value.double() {
+        return Ok(Raw::Float(value));
+    }
+
+    if let Some(value) = value.zend_str() {
+        return Ok(Raw::Bytes(value.as_bytes().to_vec()));
+    }
+
+    let Some(table) = value.array() else {
+        return Err(Error::Plan(format!(
+            "arrow received a malformed row filter: a {} is no row filter value",
+            value.get_type()
+        )));
+    };
+    let mut entries = Vec::new();
+    let mut keyed = false;
+
+    ht_for_each(table, |key, index, value| {
+        keyed |= key.is_some();
+        entries.push((
+            key.map_or_else(|| index.to_string().into_bytes(), |key| key.as_bytes().to_vec()),
+            raw(value)?,
+        ));
+
+        Ok::<(), Error>(())
+    })?;
+
+    Ok(if keyed {
+        Raw::Map(entries)
+    } else {
+        Raw::List(entries.into_iter().map(|(_, value)| value).collect())
+    })
+}
+
+pub fn batch_size(value: i64) -> PhpResult<usize> {
+    usize::try_from(value).ok().filter(|size| *size > 0).ok_or_else(|| {
+        exception(
+            INVALID_ARGUMENT,
+            "arrow Parquet batch size must be greater than 0".to_string(),
+        )
+    })
+}
+
+#[cfg(feature = "arrow-names")]
+const FOOTER_CLASS: &str = "Flow\\Parquet\\Engine\\RustParquetFooter";
+#[cfg(feature = "flow-php-names")]
+const FOOTER_CLASS: &str = "Flow\\ETL\\Adapter\\Parquet\\IO\\Engine\\FlowPhpParquetFooter";
+
+/// `ParquetFileReader::footer()`'s return, typed as the footer class of the extension that registers it: the class
+/// registers before the reader, so the covariant return type is checked.
+pub struct FooterObject(Zval);
+
+impl IntoZval for FooterObject {
+    const TYPE: DataType = DataType::object(FOOTER_CLASS);
+    const NULLABLE: bool = false;
+
+    fn set_zval(self, zv: &mut Zval, _persistent: bool) -> ZvalResult<()> {
+        *zv = self.0;
+
+        Ok(())
+    }
+}
+
+#[php_class]
+#[cfg_attr(
+    feature = "arrow-names",
+    php(
+        name = "Flow\\Parquet\\Engine\\RustParquetFileReader",
+        flags = ClassFlags::Final,
+        implements(ce = parquet_file_reader_ce, stub = "Flow\\Parquet\\ParquetFileReader")
+    )
+)]
+#[cfg_attr(
+    feature = "flow-php-names",
+    php(
+        name = "Flow\\ETL\\Adapter\\Parquet\\IO\\Engine\\FlowPhpParquetFileReader",
+        flags = ClassFlags::Final,
+        implements(ce = parquet_file_reader_ce, stub = "Flow\\Parquet\\ParquetFileReader")
+    )
+)]
+pub struct RustParquetFileReader {
+    stream: Arc<PhpStream>,
+    footer: Arc<Footer>,
+    /// Each leaf's dotted path and its index among the schema's leaves.
+    leaves: Arc<HashMap<String, usize>>,
+    int96_as_datetime: bool,
+    footer_object: Option<Zval>,
+    closed: bool,
+}
+
+impl RustParquetFileReader {
+    fn open(&self) -> PhpResult<()> {
+        if self.closed {
+            return Err(closed());
+        }
+
+        Ok(())
+    }
+
+    /// The file's stream and footer, for a reader of it: the lib's `RustColumnsReader` or a `RustBatchReader`.
+    pub fn read(&self) -> PhpResult<(&Arc<PhpStream>, &Arc<ParquetMetaData>)> {
+        self.open()?;
+
+        Ok((&self.stream, self.footer.meta()))
+    }
+
+    /// Without `int96AsDatetime`, a requested column (a leaf path, or the path of its parent) holding INT96.
+    fn refuse_int96(&self, columns: &ZendHashTable) -> PhpResult<()> {
+        if self.int96_as_datetime {
+            return Ok(());
+        }
+
+        let descr = self.footer.meta().file_metadata().schema_descr();
+        let int96 = self
+            .leaves
+            .iter()
+            .filter(|(_, leaf)| descr.column(**leaf).physical_type() == PhysicalType::INT96)
+            .map(|(path, _)| path)
+            .collect::<Vec<_>>();
+
+        for column in columns.values().filter_map(Zval::str) {
+            if int96
+                .iter()
+                .any(|leaf| *leaf == column || leaf.starts_with(&format!("{column}.")))
+            {
+                return Err(exception(
+                    INVALID_ARGUMENT,
+                    format!(
+                        "Parquet column \"{column}\" holds INT96, which arrow reads only as a datetime \
+                         (Option::INT_96_AS_DATETIME = true); read the file with \\Flow\\Parquet\\Reader::php()"
+                    ),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[php_impl]
+impl RustParquetFileReader {
+    /// Reads the footer and owns the stream; `$int96AsDatetime` false refuses an INT96 column.
+    #[php(defaults(int96AsDatetime = true))]
+    pub fn __construct(stream: &Zval, int96AsDatetime: bool) -> PhpResult<Self> {
+        let stream = Arc::new(PhpStream::new(stream)?);
+        let refused = |error| parquet_exception(error, &stream, Side::Read);
+        let source = PhpSource::new(Arc::clone(&stream)).map_err(refused)?;
+        let footer = Footer::read(&source).map_err(refused)?;
+        let leaves = footer
+            .meta()
+            .file_metadata()
+            .schema_descr()
+            .columns()
+            .iter()
+            .enumerate()
+            .map(|(index, leaf)| (leaf.path().string(), index))
+            .collect();
+
+        Ok(Self {
+            stream,
+            footer: Arc::new(footer),
+            leaves: Arc::new(leaves),
+            int96_as_datetime: int96AsDatetime,
+            footer_object: None,
+            closed: false,
+        })
+    }
+
+    /// Closes the stream; a footer taken before stays readable.
+    pub fn close(&mut self) -> PhpResult<()> {
+        self.open()?;
+        self.closed = true;
+        self.footer_object = None;
+
+        match self.stream.call("close", &mut []) {
+            Some(_) => Ok(()),
+            None => Err(parquet_exception(
+                Error::Stream("close() threw".to_string()),
+                &self.stream,
+                Side::Read,
+            )),
+        }
+    }
+
+    /// The footer the constructor read, as a `RustParquetFooter` created on the first call.
+    pub fn footer(&mut self) -> PhpResult<FooterObject> {
+        self.open()?;
+
+        if let Some(footer) = &self.footer_object {
+            return Ok(FooterObject(footer.shallow_clone()));
+        }
+
+        let footer = ZendClassObject::new(RustParquetFooter {
+            stream: Arc::clone(&self.stream),
+            footer: Arc::clone(&self.footer),
+            leaves: Arc::clone(&self.leaves),
+            metadata: None,
+            schema: None,
+            chunks: HashMap::new(),
+            thrift: None,
+        })
+        .into_zval(false)?;
+        self.footer_object = Some(footer.shallow_clone());
+
+        Ok(FooterObject(footer))
+    }
+
+    /// `$columns` (resolved names) in chunks of at most `$batchSize` rows, keyed by column, the rows `$plan` selects.
+    #[php(name = "readColumns")]
+    pub fn read_columns(&self, columns: &ZendHashTable, batchSize: i64, plan: &Zval) -> PhpResult<RustColumnsReader> {
+        self.open()?;
+        self.refuse_int96(columns)?;
+
+        RustColumnsReader::open(self, columns, batchSize, plan, false)
+    }
+
+    /// `readColumns()` with DATE, TIMESTAMP, TIME, UUID as stored: days, µs since epoch, µs since midnight, 16 bytes.
+    #[php(name = "readStoredColumns")]
+    pub fn read_stored_columns(
+        &self,
+        columns: &ZendHashTable,
+        batchSize: i64,
+        plan: &Zval,
+    ) -> PhpResult<RustColumnsReader> {
+        self.open()?;
+        self.refuse_int96(columns)?;
+
+        RustColumnsReader::open(self, columns, batchSize, plan, true)
+    }
+}
+
+#[php_class]
+#[cfg_attr(
+    feature = "arrow-names",
+    php(
+        name = "Flow\\Parquet\\Engine\\RustParquetFooter",
+        flags = ClassFlags::Final,
+        implements(ce = footer_ce, stub = "Flow\\Parquet\\ParquetFile\\Footer")
+    )
+)]
+#[cfg_attr(
+    feature = "flow-php-names",
+    php(
+        name = "Flow\\ETL\\Adapter\\Parquet\\IO\\Engine\\FlowPhpParquetFooter",
+        flags = ClassFlags::Final,
+        implements(ce = footer_ce, stub = "Flow\\Parquet\\ParquetFile\\Footer")
+    )
+)]
+pub struct RustParquetFooter {
+    /// The stream the footer was read from, named in refusals.
+    stream: Arc<PhpStream>,
+    footer: Arc<Footer>,
+    leaves: Arc<HashMap<String, usize>>,
+    metadata: Option<Zval>,
+    schema: Option<Zval>,
+    thrift: Option<Zval>,
+    /// Per flat path: the decoded `ColumnChunk` of every row group and the `ColumnOrder`, decoded once.
+    chunks: HashMap<String, (Vec<Zval>, Zval)>,
+}
+
+impl RustParquetFooter {
+    /// `FileMetaData::$schema`: the list of `SchemaElement`s.
+    fn elements(&self) -> PhpResult<Zval> {
+        thrift::decode(self.footer.bytes(), FILE_META_DATA, Some(SCHEMA))
+    }
+}
+
+#[php_impl]
+impl RustParquetFooter {
+    /// The whole footer as `Metadata`, built on the first call.
+    pub fn metadata(&mut self) -> PhpResult<MetadataObject> {
+        if let Some(metadata) = &self.metadata {
+            return Ok(MetadataObject(metadata.shallow_clone()));
+        }
+
+        let metadata = call_static(METADATA_FROM_THRIFT, &mut [self.thrift()?])?;
+        self.metadata = Some(metadata.shallow_clone());
+
+        Ok(MetadataObject(metadata))
+    }
+
+    /// `$columns` (`FlatColumn`s) as `RustRowGroupChunks`: each leaf's column chunks and column order, decoded once
+    /// per flat path and kept for the next call.
+    #[php(name = "rowGroupChunks")]
+    pub fn row_group_chunks(&mut self, columns: &ZendHashTable) -> PhpResult<RowGroupChunksObject> {
+        let mut requested = Vec::with_capacity(columns.len());
+
+        ht_for_each(columns, |_, _, column| {
+            let path = call_method(column, "flatPath", &mut [])?
+                .str()
+                .ok_or_else(|| exception(INVALID_ARGUMENT, "arrow expected a FlatColumn flat path".to_string()))?
+                .to_string();
+            let leaf = *self
+                .leaves
+                .get(&path)
+                .ok_or_else(|| exception(INVALID_ARGUMENT, format!("Parquet file has no leaf column \"{path}\"")))?;
+            requested.push((path, leaf, column.shallow_clone()));
+
+            Ok::<(), PhpException>(())
+        })?;
+
+        let counts: Vec<i64> = self
+            .footer
+            .meta()
+            .row_groups()
+            .iter()
+            .map(|group| group.num_rows())
+            .collect();
+        let groups = counts.len();
+        let row_counts = || {
+            let mut table = ZendHashTable::with_capacity(counts.len() as u32);
+
+            for (index, rows) in counts.iter().enumerate() {
+                ht_insert_long(&mut table, index as i64, zval_long(*rows));
+            }
+
+            zval_array(table)
+        };
+
+        let missing: Vec<&(String, usize, Zval)> = requested
+            .iter()
+            .filter(|(path, _, _)| !self.chunks.contains_key(path))
+            .collect();
+
+        if !missing.is_empty() {
+            let bytes = self.footer.bytes();
+            let leaves: Vec<usize> = missing.iter().map(|(_, leaf, _)| *leaf).collect();
+            let spans =
+                chunk_spans(bytes, &leaves).map_err(|error| parquet_exception(error, &self.stream, Side::Read))?;
+            let mut encoded = ZendHashTable::with_capacity(missing.len() as u32);
+            let mut orders = ZendHashTable::with_capacity(missing.len() as u32);
+
+            for (position, ((path, _, _), ranges)) in missing.iter().zip(spans.chunks).enumerate() {
+                let mut list = ZendHashTable::with_capacity(ranges.len() as u32);
+
+                for (group, range) in ranges.into_iter().enumerate() {
+                    ht_insert_long(&mut list, group as i64, zval_str(&bytes[range]));
+                }
+
+                ht_insert(&mut encoded, path.as_bytes(), zval_array(list));
+                ht_insert(
+                    &mut orders,
+                    path.as_bytes(),
+                    spans
+                        .orders
+                        .as_ref()
+                        .map_or_else(Zval::new, |orders| zval_str(&bytes[orders[position].clone()])),
+                );
+            }
+
+            let thrift = call_static(
+                ROW_GROUP_CHUNKS_FROM_THRIFT,
+                &mut [row_counts(), zval_array(encoded), zval_array(orders)],
+            )?;
+
+            for (path, _, column) in missing {
+                let mut decoded = Vec::with_capacity(groups);
+
+                for group in 0..groups {
+                    decoded.push(call_method(
+                        &thrift,
+                        "chunk",
+                        &mut [zval_long(group as i64), column.shallow_clone()],
+                    )?);
+                }
+
+                let order = call_method(&thrift, "columnOrder", &mut [column.shallow_clone()])?;
+                self.chunks.insert(path.clone(), (decoded, order));
+            }
+        }
+
+        let mut chunks = ZendHashTable::with_capacity(requested.len() as u32);
+        let mut orders = ZendHashTable::with_capacity(requested.len() as u32);
+
+        for (path, _, _) in &requested {
+            let (decoded, order) = &self.chunks[path];
+            let mut list = ZendHashTable::with_capacity(decoded.len() as u32);
+
+            for (group, chunk) in decoded.iter().enumerate() {
+                ht_insert_long(&mut list, group as i64, chunk.shallow_clone());
+            }
+
+            ht_insert(&mut chunks, path.as_bytes(), zval_array(list));
+            ht_insert(&mut orders, path.as_bytes(), order.shallow_clone());
+        }
+
+        Ok(RowGroupChunksObject(call_static(
+            ROW_GROUP_CHUNKS_DECODED,
+            &mut [row_counts(), zval_array(chunks), zval_array(orders)],
+        )?))
+    }
+
+    #[php(name = "rowsNumber")]
+    pub fn rows_number(&self) -> i64 {
+        self.footer.meta().file_metadata().num_rows()
+    }
+
+    /// The file schema, without building the row-group metadata.
+    pub fn schema(&mut self) -> PhpResult<SchemaObject> {
+        if let Some(metadata) = &self.metadata {
+            return Ok(SchemaObject(call_method(metadata, "schema", &mut [])?));
+        }
+
+        if let Some(schema) = &self.schema {
+            return Ok(SchemaObject(schema.shallow_clone()));
+        }
+
+        let schema = call_static(SCHEMA_FROM_THRIFT, &mut [self.elements()?])?;
+        self.schema = Some(schema.shallow_clone());
+
+        Ok(SchemaObject(schema))
+    }
+
+    /// Σ row group `total_byte_size` (uncompressed).
+    #[php(name = "totalByteSize")]
+    pub fn total_byte_size(&self) -> i64 {
+        self.footer
+            .meta()
+            .row_groups()
+            .iter()
+            .map(|group| group.total_byte_size())
+            .sum()
+    }
+
+    /// The whole footer as `FileMetaData`, decoded on the first call.
+    pub fn thrift(&mut self) -> PhpResult<Zval> {
+        if let Some(thrift) = &self.thrift {
+            return Ok(thrift.shallow_clone());
+        }
+
+        let thrift = thrift::decode(self.footer.bytes(), FILE_META_DATA, None)?;
+        self.thrift = Some(thrift.shallow_clone());
+
+        Ok(thrift)
+    }
+}
+
+/// A chunk of `RustColumnsReader::current()`, typed `array`.
+pub struct Chunk(Zval);
+
+impl IntoZval for Chunk {
+    const TYPE: DataType = DataType::Array;
+    const NULLABLE: bool = false;
+
+    fn set_zval(self, zv: &mut Zval, _persistent: bool) -> ZvalResult<()> {
+        *zv = self.0;
+
+        Ok(())
+    }
+}
+
+#[php_class]
+#[cfg_attr(
+    feature = "arrow-names",
+    php(
+        name = "Flow\\Arrow\\Parquet\\RustColumnsReader",
+        flags = ClassFlags::Final,
+        implements(ce = ce::iterator, stub = "\\Iterator")
+    )
+)]
+#[cfg_attr(
+    feature = "flow-php-names",
+    php(
+        name = "Flow\\ETL\\Adapter\\Parquet\\IO\\Engine\\FlowPhpColumnsReader",
+        flags = ClassFlags::Final,
+        implements(ce = ce::iterator, stub = "\\Iterator")
+    )
+)]
+pub struct RustColumnsReader {
+    reader: Option<ParquetReader>,
+    stream: Arc<PhpStream>,
+    columns: Vec<(Vec<u8>, ReadCell)>,
+    times: Option<Times>,
+    current: Option<Zval>,
+    /// The chunk read to learn the count of the `SkippedMatches` yielded before it.
+    queued: Option<Zval>,
+    skip_pending: bool,
+    /// The index of `current`.
+    key: i64,
+    started: bool,
+    /// `next()` moved past the first chunk: `rewind()` throws from here on.
+    advanced: bool,
+}
+
+impl RustColumnsReader {
+    fn open(
+        file: &RustParquetFileReader,
+        columns: &ZendHashTable,
+        batch_size: i64,
+        plan: &Zval,
+        stored: bool,
+    ) -> PhpResult<Self> {
+        let batch_size = self::batch_size(batch_size)?;
+        let (stream, meta) = file.read()?;
+        let stream = Arc::clone(stream);
+        let plan = read_plan(meta, plan, &stream)?;
+        let skip_pending = plan.offset > 0;
+        let refused = |error| parquet_exception(error, &stream, Side::Read);
+        let mut names = Vec::with_capacity(columns.len());
+
+        ht_for_each(columns, |_, _, name| {
+            names.push(
+                name.str()
+                    .ok_or_else(|| {
+                        exception(
+                            INVALID_ARGUMENT,
+                            "arrow Parquet column names must be strings".to_string(),
+                        )
+                    })?
+                    .to_string(),
+            );
+
+            Ok::<(), PhpException>(())
+        })?;
+
+        let reader = ParquetReader::open(Arc::clone(&stream), meta, &names, plan, batch_size).map_err(refused)?;
+        let cells = reader
+            .fields()
+            .iter()
+            .zip(reader.types())
+            .map(|(field, canonical)| ReadCell::new(canonical, field, stored).map_err(|e| e.in_column(field.name())))
+            .collect::<Result<Vec<_>, Error>>()
+            .map_err(refused)?;
+        let times = if cells.iter().any(ReadCell::needs_times) {
+            Some(Times::new()?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            reader: Some(reader),
+            stream,
+            columns: names.into_iter().map(String::into_bytes).zip(cells).collect(),
+            times,
+            current: None,
+            queued: None,
+            skip_pending,
+            key: 0,
+            started: false,
+            advanced: false,
+        })
+    }
+
+    /// As a Generator, the reader starts on its first `rewind()`, `valid()`, `current()`, `key()` or `next()`.
+    fn start(&mut self) -> PhpResult<()> {
+        if self.started {
+            return Ok(());
+        }
+
+        self.started = true;
+        self.pull()
+    }
+
+    /// A refused chunk ends the reader: it is never read again.
+    fn pull(&mut self) -> PhpResult<()> {
+        self.current = None;
+        let fetched = self.fetch();
+
+        if fetched.is_err() {
+            self.reader = None;
+        }
+
+        self.current = fetched?;
+
+        Ok(())
+    }
+
+    /// At most `$batchSize` rows as lists keyed by column, `None` after the last.
+    fn fetch(&mut self) -> PhpResult<Option<Zval>> {
+        if let Some(chunk) = self.queued.take() {
+            return Ok(Some(chunk));
+        }
+
+        let Some(reader) = self.reader.as_mut() else {
+            return Ok(None);
+        };
+
+        let batch = reader.next();
+        let skipped = reader.skipped();
+
+        let arrays: Vec<ArrayRef> = match batch {
+            None => {
+                self.reader = None;
+
+                return if std::mem::take(&mut self.skip_pending) {
+                    skipped_matches(skipped).map(Some)
+                } else {
+                    Ok(None)
+                };
+            }
+            Some(batch) => {
+                batch
+                    .map_err(|error| parquet_exception(error, &self.stream, Side::Read))?
+                    .1
+            }
+        };
+
+        let mut chunk = ZendHashTable::with_capacity(self.columns.len() as u32);
+
+        for ((name, cell), array) in self.columns.iter().zip(&arrays) {
+            ht_insert(&mut chunk, name, cell.values(array, self.times.as_ref())?);
+        }
+
+        if std::mem::take(&mut self.skip_pending) {
+            self.queued = Some(zval_array(chunk));
+
+            return skipped_matches(skipped).map(Some);
+        }
+
+        Ok(Some(zval_array(chunk)))
+    }
+}
+
+#[php_impl]
+impl RustColumnsReader {
+    /// `$columns`: root names or struct paths; `$batchSize` rows at most per chunk.
+    pub fn __construct(
+        file: &RustParquetFileReader,
+        columns: &ZendHashTable,
+        batch_size: i64,
+        plan: &Zval,
+    ) -> PhpResult<Self> {
+        Self::open(file, columns, batch_size, plan, false)
+    }
+
+    /// Reads the first chunk; the reader streams once, so it refuses to rewind after `next()`.
+    pub fn rewind(&mut self) -> PhpResult<()> {
+        if self.advanced {
+            return Err(exception(RUNTIME, "RustColumnsReader cannot rewind".to_string()));
+        }
+
+        self.start()
+    }
+
+    pub fn valid(&mut self) -> PhpResult<bool> {
+        self.start()?;
+
+        Ok(self.current.is_some())
+    }
+
+    pub fn current(&mut self) -> PhpResult<Option<Chunk>> {
+        self.start()?;
+
+        Ok(self.current.as_ref().map(|chunk| Chunk(chunk.shallow_clone())))
+    }
+
+    /// The chunk index from 0, null once the reader ended (as a Generator's).
+    pub fn key(&mut self) -> PhpResult<Option<i64>> {
+        self.start()?;
+
+        Ok(self.current.is_some().then_some(self.key))
+    }
+
+    #[php(name = "next")]
+    pub fn advance(&mut self) -> PhpResult<()> {
+        self.start()?;
+
+        if self.current.is_none() {
+            return Ok(());
+        }
+
+        self.advanced = true;
+        self.key += 1;
+        self.pull()
+    }
+}
+
+fn skipped_matches(count: usize) -> PhpResult<Zval> {
+    let ce = find_class(SKIPPED_MATCHES)?;
+    let mut marker = ZendObject::new(ce);
+    call_handle(
+        ce_method_ref(ce, "__construct")?,
+        Some(&mut marker),
+        &mut [zval_long(i64::try_from(count).unwrap_or(i64::MAX))],
+        "construct SkippedMatches",
+    )?;
+
+    let mut zv = Zval::new();
+    zv.set_object(&mut marker);
+
+    Ok(zv)
+}
+
+/// `Compressions::$name` as the Arrow codec name.
+fn codec(compression: &Zval) -> PhpResult<&'static str> {
+    let name = read_property(expect_object(compression, "the compression")?, "name")?;
+
+    match name.str() {
+        Some("UNCOMPRESSED") => Ok("UNCOMPRESSED"),
+        Some("SNAPPY") => Ok("SNAPPY"),
+        Some("GZIP") => Ok("GZIP"),
+        Some("BROTLI") => Ok("BROTLI"),
+        Some("LZ4" | "LZ4_RAW") => Ok("LZ4_RAW"),
+        Some("ZSTD") => Ok("ZSTD"),
+        Some("LZO") => Err(exception(
+            RUNTIME,
+            "LZO compression is not supported by the Arrow engine".to_string(),
+        )),
+        _ => Err(exception(
+            INVALID_ARGUMENT,
+            "arrow Parquet compression must be a Flow\\Parquet\\ParquetFile\\Compressions case".to_string(),
+        )),
+    }
+}
+
+#[php_class]
+#[cfg_attr(
+    feature = "arrow-names",
+    php(
+        name = "Flow\\Parquet\\Engine\\RustParquetFileWriter",
+        flags = ClassFlags::Final,
+        implements(ce = parquet_file_writer_ce, stub = "Flow\\Parquet\\ParquetFileWriter")
+    )
+)]
+#[cfg_attr(
+    feature = "flow-php-names",
+    php(
+        name = "Flow\\ETL\\Adapter\\Parquet\\IO\\Engine\\FlowPhpParquetFileWriter",
+        flags = ClassFlags::Final,
+        implements(ce = parquet_file_writer_ce, stub = "Flow\\Parquet\\ParquetFileWriter")
+    )
+)]
+pub struct RustParquetFileWriter {
+    writer: Option<ParquetWriter>,
+    stream: Arc<PhpStream>,
+    columns: Vec<WriteColumn>,
+    classes: Classes,
+    buffered: usize,
+    /// Every column holds one value per row: rows are checked into `Scalar`s.
+    scalar: bool,
+    batch_size: usize,
+}
+
+impl Drop for RustParquetFileWriter {
+    fn drop(&mut self) {
+        self.stream.detach();
+    }
+}
+
+impl RustParquetFileWriter {
+    /// `rows` rows of `columns` by name: missing writer columns are nulls, extra columns are ignored.
+    pub fn write_arrow_columns(&mut self, rows: usize, columns: &[(String, ArrayRef)]) -> PhpResult<()> {
+        self.open()?;
+        self.flush()?;
+
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| exception(RUNTIME, "Writer is not open".to_string()))?;
+        let arrays = writer
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| match columns.iter().find(|(name, _)| name == field.name()) {
+                Some((_, column)) => Arc::clone(column),
+                None => new_null_array(field.data_type(), rows),
+            })
+            .collect::<Vec<ArrayRef>>();
+
+        writer
+            .write(rows, &arrays)
+            .map_err(|error| parquet_exception(error, &self.stream, Side::Write))
+    }
+
+    fn write_lists(&mut self, columns: &ZendHashTable, stored: bool) -> PhpResult<()> {
+        if self.writer.is_none() {
+            return Err(exception(RUNTIME, "Writer is not open".to_string()));
+        }
+
+        let mut lengths = Vec::with_capacity(columns.len());
+
+        for (key, values) in columns.iter() {
+            let values = values.array().ok_or_else(|| {
+                exception(
+                    INVALID_ARGUMENT,
+                    "arrow Parquet writer columns must be arrays".to_string(),
+                )
+            })?;
+
+            lengths.push((key.to_string(), values.len()));
+        }
+
+        let count = lengths.first().map_or(0, |(_, length)| *length);
+
+        if lengths.iter().any(|(_, length)| *length != count) {
+            let described = lengths
+                .iter()
+                .map(|(name, length)| format!("\"{name}\": {length}"))
+                .collect::<Vec<_>>();
+
+            return Err(exception(
+                INVALID_ARGUMENT,
+                format!("writeColumns() takes lists of one length, got {}", described.join(", ")),
+            ));
+        }
+
+        let lists = self
+            .columns
+            .iter()
+            .map(|column| {
+                ht_get(columns, column.name.as_bytes())
+                    .and_then(Zval::array)
+                    .map(|values| values.values().collect::<Vec<_>>())
+            })
+            .collect::<Vec<_>>();
+        let mut first = 0;
+
+        // in the row door's flush steps, so a refusal names the row index append() names
+        while first < count {
+            let rows = (count - first).min(self.batch_size - self.buffered);
+
+            if self.scalar {
+                self.append_columns::<Scalar>(&lists, first, rows, stored)?;
+            } else {
+                self.append_columns::<Validated>(&lists, first, rows, stored)?;
+            }
+            first += rows;
+        }
+
+        Ok(())
+    }
+
+    fn refused(&self, error: Error) -> PhpException {
+        parquet_exception(error, &self.stream, Side::Write)
+    }
+
+    fn open(&self) -> PhpResult<()> {
+        match self.writer {
+            Some(_) => Ok(()),
+            None => Err(exception(RUNTIME, "Writer is not open".to_string())),
+        }
+    }
+
+    /// The refusal of `column` at buffered row `row`.
+    fn refusal(&self, refusal: Refusal, column: String, row: usize) -> PhpException {
+        match refusal {
+            Refusal::Value { expected, got } => self.refused(Error::Value {
+                column,
+                row,
+                expected,
+                got,
+            }),
+            Refusal::Overflow => self.refused(Error::Overflow { column, row }),
+            Refusal::Php(exception) => exception,
+        }
+    }
+
+    /// The buffered rows through `ParquetWriter::write`.
+    fn flush(&mut self) -> PhpResult<()> {
+        if self.buffered == 0 {
+            return Ok(());
+        }
+
+        let arrays = self.columns.iter_mut().map(WriteColumn::take).collect::<Vec<_>>();
+        let rows = std::mem::take(&mut self.buffered);
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| exception(RUNTIME, "Writer is not open".to_string()))?;
+
+        writer
+            .write(rows, &arrays)
+            .map_err(|error| parquet_exception(error, &self.stream, Side::Write))
+    }
+
+    /// One row whose every column was checked (`value` of column index): appended, unless a column's offsets would
+    /// pass i32, which refuses the row whole before anything is appended.
+    fn append_checked<'a, 'b, V: Checked<'a> + 'b>(&mut self, value: impl Fn(usize) -> &'b V) -> PhpResult<()> {
+        let overflow = self
+            .columns
+            .iter_mut()
+            .enumerate()
+            .position(|(index, column)| !value(index).fits(&column.cell, &mut column.builder));
+
+        if let Some(index) = overflow {
+            return Err(self.refused(Error::Overflow {
+                column: self.columns[index].name.clone(),
+                row: self.buffered,
+            }));
+        }
+
+        for (index, column) in self.columns.iter_mut().enumerate() {
+            value(index).append(&column.cell, &mut column.builder);
+        }
+
+        self.buffered += 1;
+
+        Ok(())
+    }
+
+    /// A row is checked whole into `checked` first; a refused row appends nothing.
+    fn append<'a, V: Checked<'a>>(&mut self, row: &'a Zval, checked: &mut Vec<V>) -> PhpResult<()> {
+        self.open()?;
+
+        let row = row
+            .array()
+            .ok_or_else(|| exception(INVALID_ARGUMENT, "arrow Parquet writer rows must be arrays".to_string()))?;
+        checked.clear();
+
+        for column in &self.columns {
+            let value = match ht_get(row, column.name.as_bytes()) {
+                Some(value) => V::check(&column.cell, value, column.nullable, &self.classes),
+                None => V::missing(column.nullable),
+            };
+
+            match value {
+                Ok(value) => checked.push(value),
+                Err(refusal) => return Err(self.refusal(refusal, column.name.clone(), self.buffered)),
+            }
+        }
+
+        self.append_checked(|index| &checked[index])?;
+
+        if self.buffered >= self.batch_size {
+            self.flush()?;
+        }
+
+        Ok(())
+    }
+
+    fn append_rows<'a, V: Checked<'a>>(&mut self, rows: &'a ZendHashTable) -> PhpResult<()> {
+        let mut checked = Vec::with_capacity(self.columns.len());
+
+        for row in rows.values() {
+            self.append::<V>(row, &mut checked)?;
+        }
+
+        Ok(())
+    }
+
+    /// `rows` values of every column from `first` on, column by column; a refused cell lowers the row limit of the
+    /// columns after it, so the refusal raised and the rows kept are those of `append()` row by row.
+    fn append_columns<'a, V: Checked<'a>>(
+        &mut self,
+        lists: &[Option<Vec<&'a Zval>>],
+        first: usize,
+        rows: usize,
+        stored: bool,
+    ) -> PhpResult<()> {
+        let mut limit = rows;
+        let mut refused = None;
+        let mut checked: Vec<Vec<V>> = Vec::with_capacity(self.columns.len());
+
+        for (index, column) in self.columns.iter().enumerate() {
+            let mut values = Vec::with_capacity(limit);
+            let mut stop = None;
+            let cell = if stored { &column.stored } else { &column.cell };
+
+            for row in 0..limit {
+                let value = match &lists[index] {
+                    Some(values) => V::check(cell, values[first + row], column.nullable, &self.classes),
+                    None => V::missing(column.nullable),
+                };
+
+                match value {
+                    Ok(value) => values.push(value),
+                    Err(refusal) => {
+                        stop = Some((row, refusal));
+
+                        break;
+                    }
+                }
+            }
+
+            if let Some((row, refusal)) = stop {
+                limit = row;
+                refused = Some((column.name.clone(), refusal));
+            }
+
+            checked.push(values);
+        }
+
+        (0..limit).try_for_each(|row| self.append_checked(|index| &checked[index][row]))?;
+
+        if let Some((name, refusal)) = refused {
+            return Err(self.refusal(refusal, name, self.buffered));
+        }
+
+        if self.buffered >= self.batch_size {
+            self.flush()?;
+        }
+
+        Ok(())
+    }
+}
+
+#[php_impl]
+impl RustParquetFileWriter {
+    /// `$schema`/`$options` from `SchemaConverter`/`OptionsConverter::toExtension()`; `$batchSize` rows per write.
+    pub fn __construct(
+        stream: &Zval,
+        schema: &ZendHashTable,
+        compression: &Zval,
+        options: &ZendHashTable,
+        batch_size: i64,
+    ) -> PhpResult<Self> {
+        let batch_size = self::batch_size(batch_size)?;
+        let compression = codec(compression)?;
+        let stream = Arc::new(PhpStream::new(stream)?);
+        let refused = |error| parquet_exception(error, &stream, Side::Write);
+        let schema = options::schema(schema).map_err(refused)?;
+        let columns = schema
+            .fields()
+            .iter()
+            .map(|field| WriteColumn::new(field, batch_size))
+            .collect::<Result<Vec<_>, Error>>()
+            .map_err(refused)?;
+        let scalar = columns.iter().all(|column| column.cell.is_scalar());
+        let leaves = ArrowSchemaConverter::new()
+            .convert(&schema)
+            .map_err(Error::Parquet)
+            .map_err(refused)?;
+        let writer = ParquetWriter::open(
+            PhpSink::new(Arc::clone(&stream)),
+            schema,
+            options::properties(compression, options, &leaves).map_err(refused)?,
+        )
+        .map_err(refused)?;
+
+        Ok(Self {
+            writer: Some(writer),
+            stream,
+            columns,
+            classes: Classes::new()?,
+            buffered: 0,
+            scalar,
+            batch_size,
+        })
+    }
+
+    /// A writer column the row lacks is null.
+    #[php(name = "writeRow")]
+    pub fn write_row(&mut self, row: &Zval) -> PhpResult<()> {
+        if self.scalar {
+            self.append::<Scalar>(row, &mut Vec::with_capacity(self.columns.len()))
+        } else {
+            self.append::<Validated>(row, &mut Vec::with_capacity(self.columns.len()))
+        }
+    }
+
+    #[php(name = "writeRows")]
+    pub fn write_rows(&mut self, rows: &ZendHashTable) -> PhpResult<()> {
+        if self.scalar {
+            self.append_rows::<Scalar>(rows)
+        } else {
+            self.append_rows::<Validated>(rows)
+        }
+    }
+
+    /// Every list of one length; a writer column `$columns` lacks is nulls, a key the writer lacks is ignored.
+    #[php(name = "writeColumns")]
+    pub fn write_columns(&mut self, columns: &ZendHashTable) -> PhpResult<()> {
+        self.write_lists(columns, false)
+    }
+
+    /// `writeColumns()` with DATE, TIMESTAMP, TIME, UUID as stored: days, µs since epoch, µs since midnight, 16 bytes.
+    #[php(name = "writeStoredColumns")]
+    pub fn write_stored_columns(&mut self, columns: &ZendHashTable) -> PhpResult<()> {
+        self.write_lists(columns, true)
+    }
+
+    /// An array as `writeRows()` (keys ignored), a `Traversable` row by row.
+    #[php(name = "writeBatch")]
+    pub fn write_batch(&mut self, rows: IterableArg) -> PhpResult<()> {
+        self.open()?;
+
+        if let Some(rows) = rows.0.array() {
+            return self.write_rows(rows);
+        }
+
+        for_each_value(rows.0, |row| self.write_row(row))
+    }
+
+    /// Buffered rows, the footer, then the stream closed - closed even when a flush or the footer is refused; the
+    /// first refusal is the one thrown.
+    pub fn close(&mut self) -> PhpResult<()> {
+        let flushed = self.flush();
+        let writer = self
+            .writer
+            .take()
+            .ok_or_else(|| exception(RUNTIME, "Writer is not open".to_string()))?;
+        let written = flushed.and_then(|()| writer.close().map(|_| ()).map_err(|error| self.refused(error)));
+        let closed = match self.stream.call("close", &mut []) {
+            Some(_) => Ok(()),
+            None => Err(self.refused(Error::Stream("close() threw".to_string()))),
+        };
+
+        written.and(closed)
+    }
+}
