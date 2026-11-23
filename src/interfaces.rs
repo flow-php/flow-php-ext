@@ -1,4 +1,4 @@
-//! `Flow\ETL\Foundation\Describe\Describable`, `Flow\ETL\Values\Column\{Column, ColumnBuilder, Backend, GroupedTotals, GroupedCounts}`, `Flow\ETL\Values\Grouping\GroupTable`, `Flow\ETL\IO\Loader\File\FileWriter` and the CSV / JSON / Parquet
+//! `Flow\ETL\Foundation\Describe\Describable`, `Flow\ETL\Values\Column\{Column, ColumnBuilder, Backend, GroupedTotals, GroupedCounts, GroupedMultisetHashes}`, `Flow\ETL\Values\Grouping\GroupTable`, `Flow\ETL\IO\Loader\File\FileWriter` and the CSV / JSON / Parquet
 //! adapters' encoder and open source contracts: registered at MINIT with the package
 //! files' exact signatures, so the extension's classes implement them and the package files (autoloaded only without
 //! flow_php) stay unused.
@@ -20,6 +20,8 @@ const ROWS: DataType = DataType::object("Flow\\ETL\\Values\\Rows");
 const SCHEMA: DataType = DataType::object("Flow\\ETL\\Values\\Schema");
 const SCHEMA_INFERENCE: DataType = DataType::object("Flow\\ETL\\IO\\Inference\\SchemaInference");
 const GROUPED_COUNTS: DataType = DataType::object("Flow\\ETL\\Values\\Column\\GroupedCounts");
+const MULTISET_HASH_ALGORITHM: DataType = DataType::object("Flow\\ETL\\Values\\Column\\MultisetHashAlgorithm");
+const GROUPED_MULTISET_HASHES: DataType = DataType::object("Flow\\ETL\\Values\\Column\\GroupedMultisetHashes");
 const GROUP_TABLE: DataType = DataType::object("Flow\\ETL\\Values\\Grouping\\GroupTable");
 const GROUP_IDS: DataType = DataType::object("Flow\\ETL\\Values\\Grouping\\GroupIds");
 const GROUPED_TOTALS: DataType = DataType::object("Flow\\ETL\\Values\\Column\\GroupedTotals");
@@ -40,6 +42,7 @@ static BACKEND_CE: AtomicPtr<ClassEntry> = AtomicPtr::new(std::ptr::null_mut());
 static GROUPED_TOTALS_CE: AtomicPtr<ClassEntry> = AtomicPtr::new(std::ptr::null_mut());
 static DESCRIBABLE_CE: AtomicPtr<ClassEntry> = AtomicPtr::new(std::ptr::null_mut());
 static GROUPED_COUNTS_CE: AtomicPtr<ClassEntry> = AtomicPtr::new(std::ptr::null_mut());
+static GROUPED_MULTISET_HASHES_CE: AtomicPtr<ClassEntry> = AtomicPtr::new(std::ptr::null_mut());
 static GROUP_TABLE_CE: AtomicPtr<ClassEntry> = AtomicPtr::new(std::ptr::null_mut());
 static FILE_WRITER_CE: AtomicPtr<ClassEntry> = AtomicPtr::new(std::ptr::null_mut());
 static CSV_ENCODER_CE: AtomicPtr<ClassEntry> = AtomicPtr::new(std::ptr::null_mut());
@@ -66,6 +69,11 @@ fn store_grouped_totals(ce: &'static mut ClassEntry, arg_info: ArgInfoTables) {
 fn store_grouped_counts(ce: &'static mut ClassEntry, arg_info: ArgInfoTables) {
     keep(arg_info);
     GROUPED_COUNTS_CE.store(ce, Ordering::Release);
+}
+
+fn store_grouped_multiset_hashes(ce: &'static mut ClassEntry, arg_info: ArgInfoTables) {
+    keep(arg_info);
+    GROUPED_MULTISET_HASHES_CE.store(ce, Ordering::Release);
 }
 
 fn store_group_table(ce: &'static mut ClassEntry, arg_info: ArgInfoTables) {
@@ -136,6 +144,13 @@ pub fn grouped_totals_ce() -> &'static ClassEntry {
 
 pub fn grouped_counts_ce() -> &'static ClassEntry {
     load(&GROUPED_COUNTS_CE, "Flow\\ETL\\Values\\Column\\GroupedCounts")
+}
+
+pub fn grouped_multiset_hashes_ce() -> &'static ClassEntry {
+    load(
+        &GROUPED_MULTISET_HASHES_CE,
+        "Flow\\ETL\\Values\\Column\\GroupedMultisetHashes",
+    )
 }
 
 pub fn group_table_ce() -> &'static ClassEntry {
@@ -308,6 +323,23 @@ pub fn register() -> Result<()> {
         ],
     )?;
     interface(
+        "Flow\\ETL\\Values\\Column\\GroupedMultisetHashes",
+        store_grouped_multiset_hashes,
+        vec![
+            method(
+                "add",
+                vec![Arg::new("columns", DataType::Array), Arg::new("ids", COLUMN)],
+                DataType::Void,
+            ),
+            method("hashes", vec![], COLUMN),
+            method(
+                "absorbEarlier",
+                vec![Arg::new("earlier", SELF), Arg::new("into", DataType::Array)],
+                DataType::Void,
+            ),
+        ],
+    )?;
+    interface(
         "Flow\\ETL\\Values\\Grouping\\GroupTable",
         store_group_table,
         vec![
@@ -410,6 +442,16 @@ pub fn register() -> Result<()> {
             ),
             method("groupedTotals", vec![], GROUPED_TOTALS),
             method("groupedCounts", vec![], GROUPED_COUNTS),
+            method(
+                "rowHashes",
+                vec![Arg::new("columns", DataType::Array), Arg::new("count", DataType::Long)],
+                COLUMN,
+            ),
+            method(
+                "groupedMultisetHashes",
+                vec![Arg::new("algorithm", MULTISET_HASH_ALGORITHM)],
+                GROUPED_MULTISET_HASHES,
+            ),
             method(
                 "groupTable",
                 vec![Arg::new("columns", DataType::Array), Arg::new("declared", SCHEMA)],
