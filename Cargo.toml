@@ -9,6 +9,8 @@ crate-type = ["cdylib"]
 [features]
 # arrow-data re-validates the arrays the builders hand over with `build_unchecked`; `make test` builds with it
 arrow-validate = ["arrow-data/force_validate"]
+# links libphp, so only tests/zts_request_threads.rs enables it
+zts-embed = ["ext-php-rs/embed"]
 
 [dependencies]
 ahash = "0.8"
